@@ -1,8 +1,6 @@
 #include "errors.h"
+#include "userdata.h"
 #include <arpa/inet.h>
-#include <asm-generic/socket.h>
-#include <assert.h>
-#include <bits/types/struct_iovec.h>
 #include <fcntl.h>
 #include <liburing.h>
 #include <liburing/io_uring.h>
@@ -12,6 +10,7 @@
 #include <unistd.h>
 
 #define MAX_CONNECTIONS 5
+#define FMT_ADDRLEN 32
 
 struct buffer_ring_init_params {
   size_t entries;
@@ -83,80 +82,102 @@ void format_inet_addr_from_sockfd(int sockfd, char *buf, size_t buf_sz) {
   snprintf(buf + ip_len, buf_sz - ip_len, ":%d", ntohs(sender.sin_port));
 }
 
+void tcp_server(struct io_uring *ring) {
+  int err;
+  struct io_uring_cqe *cqe;
+  struct io_uring_sqe *sqe;
+  struct msghdr msg = {};
+
+  struct buffer_ring_init_params params = {
+      .entries = 16, .entry_size = 1024, .bgid = 1};
+  struct buffer_ring br = buffer_ring_init(ring, params);
+
+  char fmt_addr[FMT_ADDRLEN];
+
+  for (;;) {
+    err = io_uring_wait_cqe(ring, &cqe);
+    err_handler(err);
+
+    struct userdata ud = decode_userdata(cqe);
+    switch (ud.op) {
+    case OP_ACCEPT: {
+      int clientfd = cqe->res;
+      err_handler(clientfd);
+
+      sqe = io_uring_get_sqe(ring);
+      io_uring_prep_recvmsg_multishot(sqe, clientfd, &msg, 0);
+      sqe->flags |= IOSQE_BUFFER_SELECT;
+      sqe->buf_group = params.bgid;
+      encode_userdata(sqe, clientfd, OP_RECVMSG);
+
+      err = io_uring_submit(ring);
+      err_handler(err);
+
+      format_inet_addr_from_sockfd(clientfd, fmt_addr, FMT_ADDRLEN);
+      break;
+    }
+    case OP_RECVMSG: {
+      int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+      int msglen = cqe->res;
+      err_handler(msglen);
+
+      struct io_uring_recvmsg_out *out =
+          io_uring_recvmsg_validate(br.bufs[bid].iov_base, cqe->res, &msg);
+      null_handler(out, "recvmsg validation failed.");
+
+      char *buf = io_uring_recvmsg_payload(out, &msg);
+      int len = io_uring_recvmsg_payload_length(out, cqe->res, &msg);
+
+      printf("Packet from %s, len: %d, content: %.*s\n", fmt_addr, cqe->res,
+             len, buf);
+      break;
+    }
+    default: {
+      err_handler(-ENOSYS);
+      break;
+    }
+    }
+    io_uring_cqe_seen(ring, cqe);
+  }
+}
+
 int main() {
   int err;
   int socketfd;
   struct io_uring_sqe *sqe;
-  struct io_uring_cqe *cqe;
   struct io_uring ring;
 
-  err = io_uring_queue_init(16, &ring, 0);
+  socketfd = socket(AF_INET, SOCK_STREAM, 0);
+  err_handler(socketfd);
+
+  int optval = 1;
+  err = setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
+                   sizeof(int));
   err_handler(err);
 
-  struct buffer_ring_init_params params = {
-      .entries = 16, .entry_size = 1024, .bgid = 1};
-  struct buffer_ring br = buffer_ring_init(&ring, params);
-
-  {
-    socketfd = socket(AF_INET, SOCK_STREAM, 0);
-    err_handler(socketfd);
-
-    int optval = 1;
-    err = setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval,
-                     sizeof(int));
-    err_handler(err);
-
-    struct sockaddr_in serveraddr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(3000),
-        .sin_addr = {INADDR_ANY},
-    };
-    err = bind(socketfd, (const struct sockaddr *)&serveraddr,
-               sizeof(serveraddr));
-    err_handler(err);
-  }
+  struct sockaddr_in serveraddr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(3000),
+      .sin_addr = {INADDR_ANY},
+  };
+  err =
+      bind(socketfd, (const struct sockaddr *)&serveraddr, sizeof(serveraddr));
+  err_handler(err);
 
   err = listen(socketfd, MAX_CONNECTIONS);
   err_handler(err);
 
+  err = io_uring_queue_init(16, &ring, 0);
+  err_handler(err);
+
   sqe = io_uring_get_sqe(&ring);
   io_uring_prep_multishot_accept(sqe, socketfd, NULL, NULL, 0);
-  err = io_uring_submit(&ring);
-  err_handler(err);
-  err = io_uring_wait_cqe(&ring, &cqe);
-  err_handler(err);
-  int clientfd = cqe->res;
-  err_handler(clientfd, "Accept");
-  io_uring_cqe_seen(&ring, cqe);
+  encode_userdata(sqe, socketfd, OP_ACCEPT);
 
-  sqe = io_uring_get_sqe(&ring);
-  struct msghdr msg = {};
-  io_uring_prep_recvmsg_multishot(sqe, clientfd, &msg, 0);
-  sqe->flags |= IOSQE_BUFFER_SELECT;
-  sqe->buf_group = 1;
   err = io_uring_submit(&ring);
   err_handler(err);
 
-  char fmt_addr[32];
-  format_inet_addr_from_sockfd(clientfd, fmt_addr, 32);
-
-  for (;;) {
-    err = io_uring_wait_cqe(&ring, &cqe);
-    err_handler(err);
-    err_handler(cqe->res, "recvmsg");
-
-    int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-    struct io_uring_recvmsg_out *out =
-        io_uring_recvmsg_validate(br.bufs[bid].iov_base, cqe->res, &msg);
-    null_handler(out, "recv_message");
-
-    char *buf = io_uring_recvmsg_payload(out, &msg);
-    int len = io_uring_recvmsg_payload_length(out, cqe->res, &msg);
-
-    printf("Packet from %s, len: %d, content: %.*s\n", fmt_addr, cqe->res, len,
-           buf);
-    io_uring_cqe_seen(&ring, cqe);
-  }
+  tcp_server(&ring);
 
   return 0;
 }
