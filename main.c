@@ -1,5 +1,6 @@
 #include <asm-generic/socket.h>
 #include <assert.h>
+#include <bits/types/struct_iovec.h>
 #include <fcntl.h>
 #include <liburing.h>
 #include <liburing/io_uring.h>
@@ -12,38 +13,82 @@
 
 #define MAX_CONNECTIONS 5
 
-struct io_uring_buf_ring*
-setup_buffer_ring(struct io_uring *ring, int id, uint8_t* buffers, int buf_ring_size, int buf_size)
+struct buffer_ring_init_params {
+	size_t entries;
+	size_t entry_size;
+	int bgid;
+}; 
+
+struct buffer_ring {
+	struct io_uring_buf_ring *br;
+	struct iovec *bufs;
+	struct buffer_ring_init_params params;
+};
+
+struct buffer_ring
+buffer_ring_init(struct io_uring *ring, struct buffer_ring_init_params params)
 {
 	struct io_uring_buf_ring *br;
-	int i;
+	size_t i;
 	int err;
 
+  uint8_t* _bufs = malloc(params.entries * params.entry_size);
+  struct iovec *bufs = malloc(params.entries * sizeof(struct iovec));
+
 	/* allocate mem for sharing buffer ring */
-	if (posix_memalign((void **) &br, 4096,
-			   buf_ring_size * sizeof(struct io_uring_buf_ring)))
-		return NULL;
+	err = posix_memalign((void **) &br, 4096,
+	                     params.entries * sizeof(struct io_uring_buf_ring));
+	err_handler(-err);
 
 	/* assign and register buffer ring */
 	struct io_uring_buf_reg reg = {
 	  .ring_addr = (unsigned long) br,
-	  .ring_entries = buf_ring_size,
-	  .bgid = id
+	  .ring_entries = params.entries,
+	  .bgid = params.bgid
 	};
 	err = io_uring_register_buf_ring(ring, &reg, 0);
-  err_handler(err, "Register buffer ring");
+  err_handler(err);
 
 	/* add initial buffers to the ring */
 	io_uring_buf_ring_init(br);
-	for (i = 0; i < buf_ring_size; i++) {
+	for (i = 0; i < params.entries; i++) {
+		bufs[i].iov_base = _bufs + (i * params.entry_size); 
+		bufs[i].iov_len = params.entry_size;
+		
 		/* add each buffer, we'll use i buffer ID */
-		io_uring_buf_ring_add(br, buffers + (i * buf_size), buf_size, i,
-				      io_uring_buf_ring_mask(buf_ring_size), i);
+		io_uring_buf_ring_add(br, bufs[i].iov_base, bufs[i].iov_len, i,
+				      io_uring_buf_ring_mask(params.entries), i);
 	}
 
 	/* we've supplied buffers, make them visible to the kernel */
-	io_uring_buf_ring_advance(br, buf_ring_size);
-	return br;
+	io_uring_buf_ring_advance(br, params.entries);
+
+	return (struct buffer_ring){
+		.br = br,
+		.bufs = bufs,
+		.params = params,
+	};
+}
+
+
+void
+format_ip_from_socket_fd(int sockfd, char* buf, size_t buf_sz)
+{
+		int err;
+
+		struct sockaddr_in sender;
+		socklen_t sender_sz = sizeof(struct sockaddr_in);
+
+  	err = getpeername(sockfd, (struct sockaddr*)&sender, &sender_sz);
+		err_handler(-err, "getpeername()");
+
+		memset(buf, 0, buf_sz);
+		// Convert IP to string
+		inet_ntop(AF_INET, &sender.sin_addr, buf, buf_sz);
+		// Get port (convert from network byte order)
+		int port = ntohs(sender.sin_port);
+
+		snprintf(buf, buf_sz, "%s:%d", buf, port);
 }
 
 int
@@ -55,11 +100,14 @@ main() {
   struct io_uring ring;
   
   err = io_uring_queue_init(16, &ring, 0);
-  err_handler(err, "Init");
+  err_handler(err);
 
-  uint8_t* buffers = malloc(16 * 1024);
-  struct io_uring_buf_ring *buf_ring = 
-    setup_buffer_ring(&ring, 1, buffers, 16, 1024); 
+	struct buffer_ring_init_params params = {
+    .entries = 16,
+    .entry_size = 1024,
+    .bgid = 1
+  };
+	struct buffer_ring br = buffer_ring_init(&ring, params); 
 
 	{  
   	socketfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -67,28 +115,28 @@ main() {
 
 		int optval = 1;
 	  err = setsockopt(socketfd, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval, sizeof(int));
-	  err_handler(err, "Error opening socket");
+	  err_handler(err);
 
 		struct sockaddr_in serveraddr = {
 			.sin_family = AF_INET,
 			.sin_port = htons(3000), 
-			.sin_addr = INADDR_ANY,
+			.sin_addr = {INADDR_ANY},
 		};
 	  err = bind(socketfd, (const struct sockaddr*) &serveraddr, sizeof(serveraddr));
-	  err_handler(err, "Error binding socket to address");
+	  err_handler(err);
 	}
 
 	err = listen(socketfd, MAX_CONNECTIONS);
-	err_handler(err, "listen()");
+	err_handler(err);
 
 	sqe = io_uring_get_sqe(&ring);
 	io_uring_prep_multishot_accept(sqe, socketfd, NULL, NULL, 0);
 	err = io_uring_submit(&ring);
-	err_handler(err, "submit accept");
+	err_handler(err);
 	err = io_uring_wait_cqe(&ring, &cqe);
-  err_handler(err, "Wait CQE");
-  err_handler(cqe->res, "Accept");
+  err_handler(err);
   int clientfd = cqe->res;
+  err_handler(clientfd, "Accept");
   io_uring_cqe_seen(&ring, cqe);
 
 	sqe = io_uring_get_sqe(&ring);
@@ -97,35 +145,27 @@ main() {
 	sqe->flags |= IOSQE_BUFFER_SELECT;	
 	sqe->buf_group = 1;
 	err = io_uring_submit(&ring);
-	err_handler(err, "submit recvmsg");
+	err_handler(err);
+
+	char fmt_addr[32]; 
+	format_ip_from_socket_fd(clientfd, fmt_addr, 32);
 
   for (;;) {
 		err = io_uring_wait_cqe(&ring, &cqe);
-  	err_handler(err, "Wait CQE recvmsg");
+  	err_handler(err);
   	err_handler(cqe->res, "recvmsg");
 
-  	// socklen_t nbytes = cqe->res;
-  	int buffer_id = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-  	void* buf = buffers + 1024 * buffer_id;
+  	int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+  	struct io_uring_recvmsg_out* out = io_uring_recvmsg_validate(br.bufs[bid].iov_base, cqe->res, &msg);
+  	null_handler(out, "recv_message");
 
-  	struct io_uring_recvmsg_out* out = io_uring_recvmsg_validate(buf, cqe->res, &msg);
-  	if (out == NULL) {
-  		fprintf(stderr, "YO!");
-  		exit(1);
-  	}
-
-  	buf = io_uring_recvmsg_payload(out, &msg);
-  	size_t len = io_uring_recvmsg_payload_length(out, cqe->res, &msg);
+  	char *buf = io_uring_recvmsg_payload(out, &msg);
+  	int len = io_uring_recvmsg_payload_length(out, cqe->res, &msg);
  
-  	printf("Packet len: %d, content: %.*s\n", cqe->res, len, buf);
+  	printf("Packet from %s, len: %d, content: %.*s\n", fmt_addr, cqe->res, len, buf);
   	io_uring_cqe_seen(&ring, cqe);
   }
 
   return 0;
-}
-
-void
-tcp_server(struct io_uring_buf_ring* buf_ring) {
-	
 }
 
