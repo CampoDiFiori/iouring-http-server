@@ -72,10 +72,10 @@ buffer_ring_init(struct io_uring *ring, struct buffer_ring_init_params params)
 
 
 void
-format_ip_from_socket_fd(int sockfd, char* buf, size_t buf_sz)
+format_inet_addr_from_sockfd(int sockfd, char* buf, size_t buf_sz)
 {
 		int err;
-
+		int ip_len;
 		struct sockaddr_in sender;
 		socklen_t sender_sz = sizeof(struct sockaddr_in);
 
@@ -83,12 +83,10 @@ format_ip_from_socket_fd(int sockfd, char* buf, size_t buf_sz)
 		err_handler(-err, "getpeername()");
 
 		memset(buf, 0, buf_sz);
-		// Convert IP to string
 		inet_ntop(AF_INET, &sender.sin_addr, buf, buf_sz);
-		// Get port (convert from network byte order)
-		int port = ntohs(sender.sin_port);
 
-		snprintf(buf, buf_sz, "%s:%d", buf, port);
+		ip_len = strlen(buf); 
+		snprintf(buf + ip_len, buf_sz - ip_len, ":%d", ntohs(sender.sin_port));
 }
 
 int
@@ -148,7 +146,7 @@ main() {
 	err_handler(err);
 
 	char fmt_addr[32]; 
-	format_ip_from_socket_fd(clientfd, fmt_addr, 32);
+	format_inet_addr_from_sockfd(clientfd, fmt_addr, 32);
 
   for (;;) {
 		err = io_uring_wait_cqe(&ring, &cqe);
